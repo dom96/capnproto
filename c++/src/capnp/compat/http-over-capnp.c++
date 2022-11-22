@@ -323,6 +323,37 @@ private:
   // Must check state->assertNotCanceled() before using this.
 };
 
+class HttpOverCapnpFactory::ConnectClientRequestContextImpl final
+    : public capnp::HttpService::ConnectClientRequestContext::Server {
+public:
+  ConnectClientRequestContextImpl(HttpOverCapnpFactory& factory,
+                           kj::HttpService::ConnectResponse& connResponse)
+      : factory(factory), connResponse(connResponse) {}
+
+  kj::Promise<void> startConnect(StartConnectContext context) override {
+    KJ_REQUIRE(!sent, "already called startConnect()");
+    sent = true;
+
+    auto params = context.getParams();
+    auto resp = params.getResponse();
+
+    auto headers = factory.headersToKj(resp.getHeaders());
+    if (resp.getIsAccept()) {
+      connResponse.accept(resp.getStatusCode(), resp.getStatusText(), headers);
+    } else {
+      connResponse.reject(resp.getStatusCode(), resp.getStatusText(), headers);
+    }
+
+    return kj::READY_NOW;
+  }
+
+private:
+  HttpOverCapnpFactory& factory;
+  bool sent = false;
+
+  kj::HttpService::ConnectResponse& connResponse;
+};
+
 class HttpOverCapnpFactory::KjToCapnpHttpServiceAdapter final: public kj::HttpService {
 public:
   KjToCapnpHttpServiceAdapter(HttpOverCapnpFactory& factory, capnp::HttpService::Client inner)
@@ -415,6 +446,40 @@ public:
           [](auto& pipeline) { return pipeline.ignoreResult(); });
     }
   }
+
+  kj::Promise<void> connect(
+      kj::StringPtr host, const kj::HttpHeaders& headers, kj::AsyncIoStream& connection,
+      ConnectResponse& tunnel) override {
+    auto rpcRequest = inner.connectRequest();
+    auto downPipe = kj::newOneWayPipe();
+    rpcRequest.setHost(host);
+    rpcRequest.setDown(factory.streamFactory.kjToCapnp(kj::mv(downPipe.out)));
+
+    auto builder = capnp::Request<
+        capnp::HttpService::ConnectParams,
+        capnp::HttpService::ConnectResults>::Builder(rpcRequest);
+    rpcRequest.adoptHeaders(factory.headersToCapnp(headers,
+        Orphanage::getForMessageContaining(builder)));
+    rpcRequest.setContext(
+        kj::heap<ConnectClientRequestContextImpl>(factory, tunnel));
+    RemotePromise<capnp::HttpService::ConnectResults> pipeline = rpcRequest.send();
+
+    auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+    // We read from `downPipe` (the other side writes into it.)
+    promises.add(downPipe.in->pumpTo(connection).then([&connection](uint64_t) {
+      connection.shutdownWrite();
+    }).eagerlyEvaluate(nullptr));
+    // We write to `up` (the other side reads from it).
+    auto up = pipeline.getUp();
+    kj::Own<kj::AsyncOutputStream> upStream = factory.streamFactory.capnpToKj(up);
+    promises.add(connection.pumpTo(*upStream).then([up = kj::mv(up)](uint64_t) mutable {
+      auto endReq = up.endRequest();
+      return endReq.send().ignoreResult();
+    }).eagerlyEvaluate(nullptr));
+
+    return kj::joinPromises(promises.finish()).attach(kj::mv(upStream), kj::mv(downPipe));
+  }
+
 
 private:
   HttpOverCapnpFactory& factory;
@@ -686,6 +751,61 @@ public:
 
       return kj::READY_NOW;
     });
+  }
+
+  kj::Promise<void> connect(ConnectContext context) override {
+    auto params = context.getParams();
+    auto host = params.getHost();
+    auto headers = factory.headersToKj(params.getHeaders());
+    auto upPipe = kj::newOneWayPipe();
+
+    PipelineBuilder<ConnectResults> pb;
+    pb.setUp(factory.streamFactory.kjToCapnp(kj::mv(upPipe.out)));
+
+    context.setPipeline(pb.build());
+
+    auto client = kj::newHttpClient(*inner);
+    auto request = client->connect(host, headers);
+    return request.status.then(
+        [this, upPipe = kj::mv(upPipe), down = params.getDown(), context = kj::mv(context),
+        io = kj::mv(request.connection)](auto status) mutable {
+      auto headers = status.headers->clone();
+      kj::Own<kj::AsyncOutputStream> stream = factory.streamFactory.capnpToKj(down);
+
+      auto req = context.getParams().getContext().startConnectRequest();
+      auto rpcResponse = req.initResponse();
+      rpcResponse.setStatusCode(status.statusCode);
+      rpcResponse.setStatusText(status.statusText);
+      rpcResponse.adoptHeaders(factory.headersToCapnp(
+          headers, Orphanage::getForMessageContaining(rpcResponse)));
+
+      if (status.statusCode < 200 || status.statusCode > 299) {
+        rpcResponse.setIsAccept(false);
+        auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+        promises.add(req.send().ignoreResult());
+        KJ_IF_MAYBE(errStream, status.errorBody) {
+          kj::Own<kj::AsyncInputStream> s = kj::mv(*errStream);
+          promises.add(s->pumpTo(*stream).ignoreResult().attach(kj::mv(errStream)));
+        }
+        return kj::joinPromises(promises.finish());
+      } else {
+        rpcResponse.setIsAccept(true);
+
+        auto promises = kj::heapArrayBuilder<kj::Promise<void>>(3);
+        promises.add(req.send().ignoreResult());
+        // We write to the `down` pipe.
+        promises.add(io->pumpTo(*stream).then([down = kj::mv(down)](uint64_t) mutable {
+          auto endReq = down.endRequest();
+          return endReq.send().ignoreResult();
+        }).eagerlyEvaluate(nullptr));
+        // We read from the `up` pipe.
+        promises.add(upPipe.in->pumpTo(*io).then([&io = *io](uint64_t size) {
+          io.shutdownWrite();
+        }).eagerlyEvaluate(nullptr));
+
+        return kj::joinPromises(promises.finish()).attach(kj::mv(io), kj::mv(upPipe), kj::mv(down), kj::mv(stream));
+      }
+    }).attach(kj::mv(host), kj::mv(headers));
   }
 
 private:
