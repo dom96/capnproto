@@ -491,6 +491,141 @@ KJ_TEST("HTTP-over-Cap'n-Proto 205 bug with HttpClientAdapter") {
   KJ_EXPECT(promise.wait(waitScope) == "");
 }
 
+class ConnectWriteCloseService final: public kj::HttpService {
+  // A simple CONNECT server that will accept a connection, write some data and close the
+  // connection.
+public:
+  ConnectWriteCloseService(kj::HttpHeaderTable& headerTable)
+      : headerTable(headerTable) {}
+
+  kj::Promise<void> request(
+      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
+    KJ_UNIMPLEMENTED("Regular HTTP requests are not implemented here.");
+  }
+
+  kj::Promise<void> connect(
+      kj::StringPtr host, const kj::HttpHeaders& headers, kj::AsyncIoStream& io,
+      kj::HttpService::ConnectResponse& response) override {
+    KJ_DBG("Got connect call in HttpService");
+    response.accept(200, "OK", kj::HttpHeaders(headerTable));
+    KJ_DBG("Wrote response?");
+    auto buffer = kj::str("test");
+    return io.write(buffer.cStr(), buffer.size()).then([&io]() mutable {
+      io.shutdownWrite();
+    }).attach(kj::mv(buffer));
+  }
+
+private:
+  kj::HttpHeaderTable& headerTable;
+};
+
+KJ_TEST("HTTP-over-Cap'n-Proto Connect with close") {
+  kj::EventLoop eventLoop;
+  kj::WaitScope waitScope(eventLoop);
+
+  auto pipe = kj::newTwoWayPipe();
+
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+
+  ByteStreamFactory streamFactory;
+  kj::HttpHeaderTable::Builder tableBuilder;
+  HttpOverCapnpFactory factory(streamFactory, tableBuilder);
+  kj::Own<kj::HttpHeaderTable> table = tableBuilder.build();
+  ConnectWriteCloseService service(*table);
+  kj::HttpServer server(timer, *table, service);
+
+  auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
+
+  auto client = newHttpClient(*table, *pipe.ends[1]);
+
+  capnp::HttpService::Client httpService = factory.kjToCapnp(newHttpService(*client));
+  auto frontCapnpHttpService = factory.capnpToKj(httpService);
+
+  struct ResponseImpl final: public kj::HttpService::ConnectResponse {
+    kj::Own<kj::PromiseFulfiller<kj::HttpClient::ConnectRequest::Status>> fulfiller;
+    ResponseImpl(kj::Own<kj::PromiseFulfiller<kj::HttpClient::ConnectRequest::Status>> fulfiller)
+      : fulfiller(kj::mv(fulfiller)) {}
+    void accept(uint statusCode, kj::StringPtr statusText, const kj::HttpHeaders& headers) override {
+      KJ_DBG("ResponseImpl accept");
+      KJ_REQUIRE(statusCode >= 200 && statusCode < 300, "the statusCode must be 2xx for accept");
+      fulfiller->fulfill(
+        kj::HttpClient::ConnectRequest::Status(
+          statusCode,
+          kj::str(statusText),
+          kj::heap(headers.clone()),
+          nullptr
+        )
+      );
+    }
+
+    kj::Own<kj::AsyncOutputStream> reject(
+        uint statusCode,
+        kj::StringPtr statusText,
+        const kj::HttpHeaders& headers,
+        kj::Maybe<uint64_t> expectedBodySize) override {
+      KJ_DBG("ResponseImpl accept");
+      KJ_UNREACHABLE;
+    }
+  };
+
+  auto clientPipe = kj::newTwoWayPipe();
+  auto paf = kj::newPromiseAndFulfiller<kj::HttpClient::ConnectRequest::Status>();
+  ResponseImpl response(kj::mv(paf.fulfiller));
+
+  auto promise = frontCapnpHttpService->connect(
+      "https://example.org"_kj, kj::HttpHeaders(*table), *clientPipe.ends[0], 
+      response).attach(kj::mv(clientPipe.ends[0]));
+  
+  auto readPaf = kj::newPromiseAndFulfiller<void>();
+  paf.promise.then(
+      [io = kj::mv(clientPipe.ends[1]), &readPaf](auto status) mutable {
+    KJ_ASSERT(status.statusCode == 200);
+    KJ_ASSERT(status.statusText == "OK"_kj);
+
+    auto buf = kj::heapArray<char>(4);
+    return io->tryRead(buf.begin(), 4, 4).then(
+        [&readPaf, buf = kj::mv(buf), io = kj::mv(io)](size_t count) mutable {
+      KJ_ASSERT(count == 4, "Expecting the stream to read 4 chars.");
+      return io->tryRead(buf.begin(), 1, 1).then(
+          [&readPaf, buf = kj::mv(buf)](size_t count) mutable {
+        KJ_ASSERT(count == 0, "Expecting the stream to get disconnected.");
+        readPaf.fulfiller->fulfill();
+      });
+    });
+  }).wait(waitScope);
+
+  KJ_ASSERT(readPaf.promise.poll(waitScope));
+
+  listenTask.wait(waitScope);
+
+  // kj::HttpHeaderTable clientHeaders;
+  // auto readPaf = kj::newPromiseAndFulfiller<void>();
+  // auto httpClient = kj::newHttpClient(*frontCapnpHttpService);
+  // auto request = client->connect("https://example.org"_kj, kj::HttpHeaders(clientHeaders));
+  // request.status.then(
+  //     [io = kj::mv(request.connection), &readPaf](auto status) mutable {
+  //   KJ_ASSERT(status.statusCode == 200);
+  //   KJ_ASSERT(status.statusText == "OK"_kj);
+
+  //   auto buf = kj::heapArray<char>(4);
+  //   return io->tryRead(buf.begin(), 4, 4).then(
+  //       [&readPaf, buf = kj::mv(buf), io = kj::mv(io)](size_t count) mutable {
+  //     KJ_ASSERT(count == 4, "Expecting the stream to read 4 chars.");
+  //     return io->tryRead(buf.begin(), 1, 1).then(
+  //         [&readPaf, buf = kj::mv(buf)](size_t count) mutable {
+  //       KJ_ASSERT(count == 0, "Expecting the stream to get disconnected.");
+  //       readPaf.fulfiller->fulfill();
+  //     });
+  //   });
+
+  // }).wait(waitScope);
+
+  // KJ_ASSERT(readPaf.promise.poll(waitScope));
+
+  // listenTask.wait(waitScope);
+}
+
 // =======================================================================================
 
 class WebSocketAccepter final: public kj::HttpService {
