@@ -648,6 +648,44 @@ KJ_TEST("HttpService isn't destroyed while call outstanding") {
   KJ_EXPECT(!destroyed);
 }
 
+KJ_TEST("HTTP-over-Cap'n-Proto REPRO") {
+  kj::EventLoop eventLoop;
+  kj::WaitScope waitScope(eventLoop);
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+
+  ByteStreamFactory streamFactory;
+  kj::HttpHeaderTable::Builder tableBuilder;
+  HttpOverCapnpFactory factory(streamFactory, tableBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+  auto headerTable = tableBuilder.build();
+
+  auto pipe = kj::newTwoWayPipe();
+
+  OneConnectNetworkAddress oneConnectAddr(kj::mv(pipe.ends[0]));
+
+  auto backHttp = kj::newHttpClient(timer, *headerTable, oneConnectAddr);
+  auto backCapnp = factory.kjToCapnp(kj::newHttpService(*backHttp));
+  auto frontCapnp = factory.capnpToKj(backCapnp);
+
+  auto frontClient = kj::newHttpClient(*frontCapnp);
+
+  auto req = frontClient->connect("https://example.org", kj::HttpHeaders(*headerTable));
+  // try {
+
+  auto resp = req.status.wait(waitScope);
+  KJ_DBG(resp.statusCode);
+  // } catch (kj::Exception& exc) {
+  //   KJ_DBG(exc);
+  // }
+
+
+  {
+    auto readPromise = expectRead(*pipe.ends[1], "CONNECT https://example.org HTTP/1.1");
+    KJ_ASSERT(readPromise.poll(waitScope));
+    readPromise.wait(waitScope);
+  }
+
+  KJ_EXPECT(!req.status.poll(waitScope));
+}
 
 class ConnectWriteCloseService final: public kj::HttpService {
   // A simple CONNECT server that will accept a connection, write some data and close the
