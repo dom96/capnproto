@@ -294,6 +294,32 @@ KJ_TEST("computeRelativeTrace") {
       {8, 7, 6, 5, 6, 7, 8, 7, 8});
 }
 
+KJ_TEST("KJ_STRINGIFY(Exception::Type) handles out-of-range values") {
+  // Valid types stringify correctly.
+  KJ_EXPECT(kj::str(kj::Exception::Type::FAILED) == "failed");
+  KJ_EXPECT(kj::str(kj::Exception::Type::OVERLOADED) == "overloaded");
+  KJ_EXPECT(kj::str(kj::Exception::Type::DISCONNECTED) == "disconnected");
+  KJ_EXPECT(kj::str(kj::Exception::Type::UNIMPLEMENTED) == "unimplemented");
+
+  // Out-of-range type must not crash; should return "(unknown)".
+  auto bogus = static_cast<kj::Exception::Type>(99);
+  KJ_EXPECT(kj::str(bogus) == "(unknown)");
+
+  // Maximum uint16 value (worst-case wire input from capnp enum).
+  auto maxBogus = static_cast<kj::Exception::Type>(0xFFFF);
+  KJ_EXPECT(kj::str(maxBogus) == "(unknown)");
+}
+
+KJ_TEST("Exception with out-of-range type stringifies safely") {
+  // Constructing a kj::Exception with an invalid type (e.g. from an unchecked wire cast)
+  // must not crash when the exception is stringified.
+  kj::Exception e(static_cast<kj::Exception::Type>(0xFFFF),
+                  "test.c++", 42, kj::heapString("bogus type test"));
+  auto s = kj::str(e);
+  KJ_ASSERT(strstr(s.cStr(), "(unknown)") != nullptr, s);
+  KJ_ASSERT(strstr(s.cStr(), "bogus type test") != nullptr, s);
+}
+
 }  // namespace
 }  // namespace _ (private)
 }  // namespace kj
